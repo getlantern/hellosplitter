@@ -9,10 +9,14 @@ import (
 	"io"
 	"net"
 	"sync"
+
+	"github.com/getlantern/golog"
 )
 
 // This file defines the public API. Most other files in this package support parsing of the
 // ClientHello and are adapted from crypto/tls.
+
+var log = golog.LoggerFor("hellosplitter")
 
 // A BufferedWriteError occurs when a Conn attempts to write buffered data and fails.
 type BufferedWriteError struct {
@@ -85,7 +89,7 @@ type Conn struct {
 // ClientHello, use Conn.SetNoDelay.
 //
 // If conn is not a *net.TCPConn, it must mimic TCP_NODELAY (sending packets as soon as they are
-// ready).
+// ready). If the host OS does not support TCP_NODELAY, hello-splitting may not function as desired.
 func Wrap(conn net.Conn, f SplitFunc) *Conn {
 	return &Conn{conn, f, new(bytes.Buffer), false, sync.Mutex{}, false}
 }
@@ -130,8 +134,7 @@ func (c *Conn) checkHello(b []byte) (int, error) {
 			// No delay is the default, but we set it for good measure. If the type check fails and
 			// the transport is not a net.TCPConn, we just assume the user knows what they're doing.
 			if err := tcpConn.SetNoDelay(true); err != nil {
-				cause := fmt.Errorf("failed to set TCP_NODELAY: %w", err)
-				return 0, BufferedWriteError{contents(c.helloBuf), 0, cause}
+				log.Errorf("failed to set TCP_NODELAY: %v", err)
 			}
 		}
 		if parseErr == nil {
@@ -149,8 +152,7 @@ func (c *Conn) checkHello(b []byte) (int, error) {
 			c.wroteHello = true
 			if c.queuedNoDelayFalse && isTCPConn {
 				if err := tcpConn.SetNoDelay(false); err != nil {
-					cause := fmt.Errorf("failed to disable TCP_NODELAY after hello: %w", err)
-					return writtenFromB, BufferedWriteError{contents(c.helloBuf), writtenFromB, cause}
+					log.Errorf("failed to disable TCP_NODELAY after hello: %v", err)
 				}
 			}
 			c.helloBuf = nil
