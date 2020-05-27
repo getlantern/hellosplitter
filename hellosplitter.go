@@ -21,10 +21,21 @@ type BufferedWriteError struct {
 	// Written is the number of bytes from BufferedData which were successfully written to the
 	// underlying transport.
 	Written int
+
+	cause error
 }
 
 func (err BufferedWriteError) Error() string {
-	return "failed to write all buffered data to transport"
+	msg := "failed to write all buffered data to transport"
+	if err.cause != nil {
+		return fmt.Sprintf("%s: %v", msg, err.cause)
+	}
+	return msg
+}
+
+// Unwrap supports Go 1.13-style error unwrapping.
+func (err BufferedWriteError) Unwrap() error {
+	return err.cause
 }
 
 // A HelloParsingError occurs when a Conn fails to parse buffered data as a ClientHello.
@@ -60,12 +71,23 @@ type Conn struct {
 
 	wroteHello     bool
 	wroteHelloLock sync.Mutex
+
+	// True iff SetNoDelay(false) was called before the ClientHello was sent. Also protected by
+	// wroteHelloLock.
+	queuedNoDelayFalse bool
 }
 
 // Wrap the input connection with a hello-splitting connection. The ClientHello should be the first
 // record written to the returned connection.
+//
+// If conn is a *net.TCPConn, then TCP_NODELAY will be configured on the connection. This is a
+// requirement for splitting the ClientHello. To override this behavior for transmissions after the
+// ClientHello, use Conn.SetNoDelay.
+//
+// If conn is not a *net.TCPConn, it must mimic TCP_NODELAY (sending packets as soon as they are
+// ready).
 func Wrap(conn net.Conn, f SplitFunc) *Conn {
-	return &Conn{conn, f, new(bytes.Buffer), false, sync.Mutex{}}
+	return &Conn{conn, f, new(bytes.Buffer), false, sync.Mutex{}, false}
 }
 
 func (c *Conn) Write(b []byte) (n int, err error) {
@@ -78,6 +100,23 @@ func (c *Conn) Write(b []byte) (n int, err error) {
 	return n + m, err
 }
 
+// SetNoDelay behaves like net.TCPConn.SetNoDelay except that the choice only applies after the
+// ClientHello. Until the ClientHello is set, TCP_NODELAY will always be used.
+//
+// This is a no-op if the underlying transport is not a *net.TCPConn.
+func (c *Conn) SetNoDelay(noDelay bool) error {
+	c.wroteHelloLock.Lock()
+	defer c.wroteHelloLock.Unlock()
+	if c.wroteHello {
+		if tcpConn, ok := c.Conn.(*net.TCPConn); ok {
+			return tcpConn.SetNoDelay(noDelay)
+		}
+	} else if !noDelay {
+		c.queuedNoDelayFalse = true
+	}
+	return nil
+}
+
 // Returns the number of bytes written *from b*. Note that more bytes may be written to the
 // underlying transport if part of the hello was previously buffered.
 func (c *Conn) checkHello(b []byte) (int, error) {
@@ -86,20 +125,34 @@ func (c *Conn) checkHello(b []byte) (int, error) {
 	if !c.wroteHello {
 		c.helloBuf.Write(b) // Writes to bytes.Buffers do not return errors.
 		nHello, parseErr := validateClientHello(c.helloBuf.Bytes())
+		tcpConn, isTCPConn := c.Conn.(*net.TCPConn)
+		if isTCPConn {
+			// No delay is the default, but we set it for good measure. If the type check fails and
+			// the transport is not a net.TCPConn, we just assume the user knows what they're doing.
+			if err := tcpConn.SetNoDelay(true); err != nil {
+				cause := fmt.Errorf("failed to set TCP_NODELAY: %w", err)
+				return 0, BufferedWriteError{contents(c.helloBuf), 0, cause}
+			}
+		}
 		if parseErr == nil {
 			var writeN int
 			splits := c.splitFunc(c.helloBuf.Bytes()[:nHello])
 			for _, split := range splits {
-				// TODO: is this actually going to result in separate packets or will they be coalesced?
 				splitN, splitErr := c.Conn.Write(split)
 				writeN += splitN
 				if splitErr != nil {
 					writtenFromB := max(len(b)-(c.helloBuf.Len()-writeN), 0)
-					return writtenFromB, BufferedWriteError{contents(c.helloBuf), writeN}
+					return writtenFromB, BufferedWriteError{contents(c.helloBuf), writeN, nil}
 				}
 			}
 			writtenFromB := len(b) - (c.helloBuf.Len() - nHello)
 			c.wroteHello = true
+			if c.queuedNoDelayFalse && isTCPConn {
+				if err := tcpConn.SetNoDelay(false); err != nil {
+					cause := fmt.Errorf("failed to disable TCP_NODELAY after hello: %w", err)
+					return writtenFromB, BufferedWriteError{contents(c.helloBuf), writtenFromB, cause}
+				}
+			}
 			c.helloBuf = nil
 			return writtenFromB, nil
 		} else if !errors.Is(parseErr, io.EOF) {
