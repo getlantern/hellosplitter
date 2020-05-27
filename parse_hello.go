@@ -27,7 +27,7 @@ func validateClientHello(b []byte) (n int, err error) {
 	if !m.unmarshal(b) {
 		return 0, fmt.Errorf("malformed message")
 	}
-	return len(b), nil
+	return len(b) + recordHeaderLen, nil
 }
 
 func parseHandshakeHeader(b []byte) (msgType uint8, rest []byte, err error) {
