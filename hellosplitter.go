@@ -11,10 +11,8 @@ import (
 	"sync"
 
 	"github.com/getlantern/golog"
+	"github.com/getlantern/tlsutil"
 )
-
-// This file defines the public API. Most other files in this package support parsing of the
-// ClientHello and are adapted from crypto/tls.
 
 var log = golog.LoggerFor("hellosplitter")
 
@@ -128,7 +126,7 @@ func (c *Conn) checkHello(b []byte) (int, error) {
 	defer c.wroteHelloLock.Unlock()
 	if !c.wroteHello {
 		c.helloBuf.Write(b) // Writes to bytes.Buffers do not return errors.
-		nHello, parseErr := validateClientHello(c.helloBuf.Bytes())
+		nHello, parseErr := tlsutil.ValidateClientHello(c.helloBuf.Bytes())
 		tcpConn, isTCPConn := c.Conn.(*net.TCPConn)
 		if isTCPConn {
 			// No delay is the default, but we set it for good measure. If the type check fails and
